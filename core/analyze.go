@@ -492,7 +492,9 @@ func (a *Analysis) detectLines() {
 	maxDark := 20.0
 	if len(ref) > 0 {
 		sort.Float64s(ref)
-		maxDark = ref[len(ref)/2] + lineDarknessMargin
+		// A low percentile: drawn lines are the darkest strokes, even when
+		// dark parts of objects produce many more candidates.
+		maxDark = ref[len(ref)/4] + lineDarknessMargin
 	}
 	maxDark = math.Max(12, math.Min(32, maxDark))
 	// keep segments whose width is consistent with the stroke width
@@ -889,9 +891,9 @@ func (a *Analysis) BlackFraction(r Rect) float64 {
 	return f
 }
 
-// halfDiskClutter samples the object mask in the half disk of radius rad
-// beyond end e (analysis coordinates) in direction d.
-func (a *Analysis) halfDiskClutter(e, d Pt, rad, skip float64) float64 {
+// halfDiskFraction samples a mask (through its integral image) in the half
+// disk of radius rad beyond end e (analysis coordinates) in direction d.
+func (a *Analysis) halfDiskFraction(in *Integral, e, d Pt, rad, skip float64) float64 {
 	obj, tot := 0, 0
 	nrm := d.Perp()
 	step := math.Max(1, rad/12)
@@ -907,7 +909,7 @@ func (a *Analysis) halfDiskClutter(e, d Pt, rad, skip float64) float64 {
 				obj++ // outside the photo counts as blocked
 				continue
 			}
-			if a.objInt.Count(x, y, x+1, y+1) > 0 {
+			if in.Count(x, y, x+1, y+1) > 0 {
 				obj++
 			}
 		}
@@ -918,26 +920,97 @@ func (a *Analysis) halfDiskClutter(e, d Pt, rad, skip float64) float64 {
 	return float64(obj) / float64(tot)
 }
 
-// endScore returns how unsuitable end e (direction d pointing outwards) is for
-// a label; lower is better. Coordinates are in analysis space.
-func (a *Analysis) endScore(e, d Pt, t float64) float64 {
+// endInfo describes the surroundings of one end of a stroke.
+type endInfo struct {
+	score     float64 // how unsuitable the end is for a number; lower is better
+	nearBlack float64 // share of dark pixels just beyond the end
+	boxBlack  float64 // share of dark pixels where the number would go
+}
+
+// clean reports whether nothing dark continues beyond the end: a drawn
+// leader line stops in free space, while slots, ribs and edges of dark
+// objects run into other dark structures.
+func (e endInfo) clean() bool {
+	return e.nearBlack <= maxNearBlack && e.boxBlack <= maxBoxBlack
+}
+
+const (
+	maxNearBlack = 0.06
+	maxBoxBlack  = 0.04
+	// maxEndScore is the largest acceptable clutter score of the free end.
+	maxEndScore = 0.45
+)
+
+// endScore examines end e (direction d pointing outwards). Coordinates are in
+// analysis space.
+func (a *Analysis) endScore(e, d Pt, t float64) endInfo {
 	h := a.DigitHeight * a.k
-	near := a.halfDiskClutter(e, d, math.Max(3*t, 0.6*h), 1.5)
+	rad := math.Max(3*t, 0.6*h)
+	near := a.halfDiskFraction(a.objInt, e, d, rad, 1.5)
 	w := 1.1 * h
 	gap := 0.25 * h
 	c := LabelCenter(e, d, w, h, gap)
 	box := RectAt(c, w, h)
 	f, inside := a.objInt.Fraction(box)
 	boxScore := f*inside + (1 - inside)
-	return 0.55*near + 0.45*boxScore
+	var info endInfo
+	info.nearBlack = a.halfDiskFraction(a.blkInt, e, d, rad, math.Max(3, 0.5*t))
+	info.boxBlack, _ = a.blkInt.Fraction(box)
+	info.score = 0.55*near + 0.45*boxScore
+	// Dark material at an end makes it a poor place for the number.
+	info.score += 2*math.Max(0, info.nearBlack-0.02) + 2*math.Max(0, info.boxBlack-0.01)
+	return info
+}
+
+// extendThroughDark follows the stroke from end e in direction d while the
+// pixels on its axis stay dark. The new end is accepted only if the walk
+// finishes as a thin stroke of the same width with clean sides, i.e. the
+// drawn line re-emerged from the dark object and stopped in free space.
+func (a *Analysis) extendThroughDark(e, d Pt, width, t float64) Pt {
+	maxWalk := 0.25 * float64(max(a.aw, a.ah))
+	isBlack := func(p Pt) bool { return a.black.At(int(math.Round(p.X)), int(math.Round(p.Y))) }
+	if !isBlack(e.Add(d.Mul(2))) {
+		return e
+	}
+	n := d.Perp()
+	gap := 0
+	last := 0.0
+	for s := 1.0; s <= maxWalk; s++ {
+		if isBlack(e.Add(d.Mul(s))) {
+			last, gap = s, 0
+			continue
+		}
+		gap++
+		if gap > 2 {
+			break
+		}
+	}
+	if last < 3*t || last >= maxWalk {
+		return e
+	}
+	// The last 3t pixels must look like the drawn line: dark core, light sides.
+	off := width/2 + 2.5
+	for s := last - 3*t; s <= last-1; s++ {
+		p := e.Add(d.Mul(s))
+		if !isBlack(p) || isBlack(p.Add(n.Mul(off))) || isBlack(p.Sub(n.Mul(off))) ||
+			isBlack(p.Add(n.Mul(off+2))) || isBlack(p.Sub(n.Mul(off+2))) {
+			return e
+		}
+	}
+	return e.Add(d.Mul(last))
 }
 
 // orient decides which end of s is free and converts to original coordinates.
 func (a *Analysis) orient(s segment) (Line, bool) {
 	t := a.Stroke * a.k
 	d := s.dir()
-	sc0 := a.endScore(s.p0, d.Mul(-1), t)
-	sc1 := a.endScore(s.p1, d, t)
+	// A line drawn across a dark object may have been found only up to that
+	// object; follow it to where it really ends.
+	s.p0 = a.extendThroughDark(s.p0, d.Mul(-1), s.width, t)
+	s.p1 = a.extendThroughDark(s.p1, d, s.width, t)
+	e0 := a.endScore(s.p0, d.Mul(-1), t)
+	e1 := a.endScore(s.p1, d, t)
+	sc0, sc1 := e0.score, e1.score
 	// local outwardness: the label end should point away from nearby objects
 	mid := s.p0.Add(s.p1).Mul(0.5)
 	L := s.length()
@@ -967,16 +1040,21 @@ func (a *Analysis) orient(s segment) (Line, bool) {
 		}
 	}
 	var l Line
+	free := e1
 	if sc1 <= sc0 {
 		l = Line{Free: a.fromA(s.p1), Inner: a.fromA(s.p0)}
 	} else {
 		l = Line{Free: a.fromA(s.p0), Inner: a.fromA(s.p1)}
+		free = e0
 	}
 	l.Width = s.width / a.k
 	l.Confidence = math.Abs(sc1 - sc0)
-	best := math.Min(sc0, sc1)
-	// A leader line needs at least one end on free background.
-	if best > 0.6 {
+	if debugLines {
+		fmt.Printf("  orient (%.0f,%.0f)-(%.0f,%.0f): free score=%.2f nearBlack=%.2f boxBlack=%.2f other=%.2f\n",
+			s.p0.X, s.p0.Y, s.p1.X, s.p1.Y, free.score, free.nearBlack, free.boxBlack, math.Max(sc0, sc1))
+	}
+	// A leader line ends in free space, where its number goes.
+	if math.Min(sc0, sc1) > maxEndScore || !free.clean() {
 		return l, false
 	}
 	return l, true

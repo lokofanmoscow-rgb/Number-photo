@@ -27,7 +27,8 @@ const helpText = `• Откройте фото кнопкой, через Ctrl+
 • Перетащите число мышью, чтобы сдвинуть его вдоль линии.
 • Правый щелчок по числу: удалить, перенести на другой конец линии, задать номер. Delete — удалить число под курсором.
 • Щелчок по линии без числа добавляет число.
-• Колесо мыши — масштаб, перетаскивание фона — прокрутка.
+• Обведите рамкой (тянуть мышью по фону) — числа внутри рамки удалятся.
+• Колесо мыши — масштаб; Shift + перетаскивание или средняя кнопка — прокрутка.
 • Ctrl+Z — отменить.`
 
 var orderNames = []string{
@@ -78,6 +79,8 @@ type App struct {
 	dragExtra    float64
 	dragStart    core.Pt
 	panning      bool
+	selecting    bool
+	selX1, selY1 int
 	panCX, panCY float64
 	moved        bool
 	hover        *core.Label
@@ -88,6 +91,7 @@ type App struct {
 
 	bgBrush  *walk.SolidColorBrush
 	hoverPen *walk.CosmeticPen
+	selPen   *walk.CosmeticPen
 	hintFont *walk.Font
 
 	updating bool
@@ -130,6 +134,7 @@ func (app *App) create() error {
 		return err
 	}
 	app.hoverPen, _ = walk.NewCosmeticPen(walk.PenSolid, walk.RGB(255, 140, 0))
+	app.selPen, _ = walk.NewCosmeticPen(walk.PenDash, walk.RGB(255, 255, 255))
 	app.hintFont, _ = walk.NewFont("Segoe UI", 14, 0)
 
 	err = MainWindow{
@@ -152,6 +157,7 @@ func (app *App) create() error {
 			Menu{Text: "&Правка", Items: []MenuItem{
 				Action{Text: "&Отменить", Shortcut: Shortcut{Modifiers: walk.ModControl, Key: walk.KeyZ}, OnTriggered: app.undo},
 				Action{Text: "Найти линии заново (сбросить правки)", OnTriggered: app.resetEdits},
+				Action{Text: "Удалить все числа", OnTriggered: app.deleteAll},
 			}},
 			Menu{Text: "&Вид", Items: []MenuItem{
 				Action{Text: "По размеру окна", Shortcut: Shortcut{Modifiers: walk.ModControl, Key: walk.Key0}, OnTriggered: func() { app.zoom = 1; app.canvas.Invalidate() }},
@@ -687,13 +693,22 @@ func (app *App) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	win.SetStretchBltMode(hdc, win.HALFTONE)
 	stretchBGRA(hdc, int(math.Round(ox)), int(math.Round(oy)), int(math.Round(W*s)), int(math.Round(H*s)),
 		app.bgra, app.result.Rect.Dx(), app.result.Rect.Dy())
-	if l := app.hover; l != nil && app.layout != nil {
+	outline := func(l *core.Label) {
 		r := l.Box.Inset(-0.12 * app.layout.DigitHeight)
-		rect := walk.Rectangle{
+		c.DrawRectanglePixels(app.hoverPen, walk.Rectangle{
 			X: int(ox + r.X0*s), Y: int(oy + r.Y0*s),
 			Width: int(r.W()*s) + 1, Height: int(r.H()*s) + 1,
+		})
+	}
+	if app.selecting && app.moved && app.layout != nil {
+		for _, l := range app.labelsInSelection() {
+			outline(l)
 		}
-		c.DrawRectanglePixels(app.hoverPen, rect)
+		x0, x1 := min(app.downX, app.selX1), max(app.downX, app.selX1)
+		y0, y1 := min(app.downY, app.selY1), max(app.downY, app.selY1)
+		c.DrawRectanglePixels(app.selPen, walk.Rectangle{X: x0, Y: y0, Width: x1 - x0 + 1, Height: y1 - y0 + 1})
+	} else if l := app.hover; l != nil && app.layout != nil {
+		outline(l)
 	}
 	if app.busy {
 		c.DrawTextPixels("Поиск линий…", app.hintFont, walk.RGB(255, 255, 255),
@@ -729,9 +744,12 @@ func (app *App) mouseDown(x, y int, button walk.MouseButton) {
 			app.dragLabel = hit
 			app.dragExtra = hit.Extra
 			app.dragStart = p
-		} else {
+		} else if walk.ModifiersDown()&walk.ModShift != 0 {
 			app.panning = true
 			app.panCX, app.panCY = app.cx, app.cy
+		} else {
+			app.selecting = true
+			app.selX1, app.selY1 = x, y
 		}
 	case walk.MiddleButton:
 		app.panning = true
@@ -765,6 +783,13 @@ func (app *App) mouseMove(x, y int, button walk.MouseButton) {
 		app.layout.Reposition(l, app.options())
 		app.layout.KeepInside(l, app.options(), app.img.Rect.Dx(), app.img.Rect.Dy())
 		app.render()
+		return
+	}
+	if app.selecting && button&walk.LeftButton != 0 {
+		app.selX1, app.selY1 = x, y
+		if app.moved {
+			app.canvas.Invalidate()
+		}
 		return
 	}
 	if app.panning && button&(walk.LeftButton|walk.MiddleButton) != 0 {
@@ -808,6 +833,15 @@ func (app *App) mouseUp(x, y int, button walk.MouseButton) {
 				app.setStatus("Число сдвинуто вдоль линии. Ctrl+Z — отменить.")
 			}
 			app.dragLabel = nil
+		} else if app.selecting {
+			app.selecting = false
+			if app.moved {
+				app.selX1, app.selY1 = x, y
+				app.deleteLabels(app.labelsInSelection())
+				app.canvas.Invalidate()
+			} else {
+				app.addLabelAt(app.toImage(x, y), false)
+			}
 		} else if app.panning && !app.moved {
 			app.addLabelAt(app.toImage(x, y), false)
 		}
@@ -883,6 +917,7 @@ func (app *App) buildContextMenu() {
 	app.actAdd = mk("Добавить число к линии здесь", func() { app.addLabelAt(app.ctxPoint, true) })
 	menu.Actions().Add(walk.NewSeparatorAction())
 	app.actRedetect = mk("Найти линии заново (сбросить правки)", app.resetEdits)
+	mk("Удалить все числа", app.deleteAll)
 	app.canvas.SetContextMenu(menu)
 }
 
@@ -898,17 +933,58 @@ func (app *App) updateContextMenu() {
 }
 
 func (app *App) deleteLabel(l *core.Label) {
+	app.deleteLabels([]*core.Label{l})
+}
+
+// deleteLabels removes the given numbers (one undo step).
+func (app *App) deleteLabels(del []*core.Label) {
+	if len(del) == 0 {
+		return
+	}
+	gone := map[*core.Label]bool{}
+	for _, l := range del {
+		gone[l] = true
+	}
 	app.pushUndo()
 	out := app.labels[:0:0]
 	for _, x := range app.labels {
-		if x != l {
+		if !gone[x] {
 			out = append(out, x)
 		}
 	}
 	app.labels = out
 	app.hover = nil
 	app.relayout()
-	app.setStatus("Число удалено. Ctrl+Z — отменить.")
+	if len(del) == 1 {
+		app.setStatus("Число удалено. Ctrl+Z — отменить.")
+	} else {
+		app.setStatus("Удалено чисел: %d. Ctrl+Z — отменить.", len(del))
+	}
+}
+
+func (app *App) deleteAll() {
+	if len(app.labels) == 0 {
+		return
+	}
+	app.deleteLabels(append([]*core.Label(nil), app.labels...))
+	app.setStatus("Все числа удалены. Щёлкайте по линиям, чтобы добавить числа, или Ctrl+Z — отменить.")
+}
+
+// labelsInSelection returns the numbers whose centre lies inside the
+// rectangle being dragged.
+func (app *App) labelsInSelection() []*core.Label {
+	if app.layout == nil {
+		return nil
+	}
+	a, b := app.toImage(app.downX, app.downY), app.toImage(app.selX1, app.selY1)
+	r := core.Rect{X0: math.Min(a.X, b.X), Y0: math.Min(a.Y, b.Y), X1: math.Max(a.X, b.X), Y1: math.Max(a.Y, b.Y)}
+	var out []*core.Label
+	for _, l := range app.layout.Labels {
+		if r.Contains(l.Center) {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 func (app *App) addLabelAt(p core.Pt, explicit bool) {

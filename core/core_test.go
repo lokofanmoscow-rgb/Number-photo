@@ -167,6 +167,29 @@ func TestPhoto2Columns(t *testing.T) {
 	}
 }
 
+// A black perforated tray with straight slots as dark as the drawn lines
+// (pasted into photo 2) must not get numbers: its slots run into other dark
+// slots, while a leader line ends in free space.
+func TestTraySlotsAreNotLines(t *testing.T) {
+	a, _ := analyzeFile(t, "../testdata/tray_synthetic.jpg")
+	tray := Rect{700, 180, 1260, 740}
+	real := 0
+	for _, l := range a.Lines {
+		if tray.Contains(l.Inner) {
+			real++
+			if tray.Contains(l.Free) {
+				t.Errorf("line inside the tray detected: %+v", l)
+			}
+		}
+	}
+	if real != 2 {
+		t.Errorf("found %d lines starting on the tray, want the 2 drawn ones", real)
+	}
+	if len(a.Lines) != 28 {
+		t.Errorf("found %d lines, want 28", len(a.Lines))
+	}
+}
+
 func TestScaledPhotos(t *testing.T) {
 	for _, tc := range []struct {
 		path  string
