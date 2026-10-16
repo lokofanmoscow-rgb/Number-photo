@@ -63,7 +63,7 @@ const (
 	coreMaxChroma = 25
 	// Median brightness along the axis of a drawn line must not exceed the
 	// brightness of clearly drawn lines by more than this.
-	lineDarknessMargin = 10
+	lineDarknessMargin = 12
 )
 
 // maxAnalysisDim limits the resolution used for analysis.
@@ -481,20 +481,22 @@ func (a *Analysis) detectLines() {
 	segs = a.mergeCollinear(segs, t)
 	// Drawn lines are the darkest strokes in the photo. Measure how dark the
 	// obvious ones are (long, with clean sides) to reject dark object edges.
+	// The reference is the darkest such stroke, not a typical one: a dark
+	// object (a perforated tray, a grille) can give dozens of slightly
+	// lighter candidates against a handful of drawn lines.
 	dark := make([]float64, len(segs))
-	var ref []float64
+	ref := math.Inf(1)
 	for i, s := range segs {
 		dark[i] = a.axisDarkness(s)
 		if s.length() >= 2*lmin && a.sideClean(s, t) >= 0.8 && s.width >= 0.55*t && s.width <= 1.7*t {
-			ref = append(ref, dark[i])
+			ref = math.Min(ref, dark[i])
 		}
 	}
 	maxDark := 20.0
-	if len(ref) > 0 {
-		sort.Float64s(ref)
-		// A low percentile: drawn lines are the darkest strokes, even when
-		// dark parts of objects produce many more candidates.
-		maxDark = ref[len(ref)/4] + lineDarknessMargin
+	if !math.IsInf(ref, 1) {
+		// Thin lines in a reduced photo are lighter and vary more, hence
+		// the relative part.
+		maxDark = math.Max(ref+lineDarknessMargin, 2*ref)
 	}
 	maxDark = math.Max(12, math.Min(32, maxDark))
 	// keep segments whose width is consistent with the stroke width

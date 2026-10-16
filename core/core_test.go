@@ -190,6 +190,30 @@ func TestTraySlotsAreNotLines(t *testing.T) {
 	}
 }
 
+// The user's photo with a real perforated tray: only the 4 drawn lines may
+// get numbers, also at the higher resolution of the original camera file.
+func TestRealTray(t *testing.T) {
+	img, err := LoadImage("../testdata/tray_real.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scale := range []float64{1, 1.77} {
+		w := int(float64(img.Rect.Dx()) * scale)
+		h := int(float64(img.Rect.Dy()) * scale)
+		dst := image.NewRGBA(image.Rect(0, 0, w, h))
+		draw.CatmullRom.Scale(dst, dst.Rect, img, img.Rect, draw.Src, nil)
+		a := Analyze(dst)
+		if len(a.Lines) != 4 {
+			t.Errorf("x%.2f: found %d lines, want 4", scale, len(a.Lines))
+		}
+		for _, l := range a.Lines {
+			if l.Dir().Y > -0.9 {
+				t.Errorf("x%.2f: line %+v should point up to its number", scale, l)
+			}
+		}
+	}
+}
+
 func TestScaledPhotos(t *testing.T) {
 	for _, tc := range []struct {
 		path  string
